@@ -19,6 +19,11 @@
 // history gets a floor wide enough to cover a launch-night-scale
 // refresh, while a history with jumps uses their observed size.
 //
+// Degenerate inputs degrade instead of crashing: an empty
+// history, a zero horizon, or an unparseable case still yields
+// a valid forecast (neutral and wide, or anchored at the last
+// rate), and one bad case never aborts the run.
+//
 // Node 22, standard library only, no network, deterministic.
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -69,6 +74,10 @@ const TREND_WEIGHT = 0.5;
 const THIN_TREND_UNC = 0.3;
 // Cap on the trend/residual uncertainty term.
 const MAX_TREND_UNC = 1.0;
+// Neutral forecast for a case with no usable history (or a
+// non-finite median/spread): median 50% with a wide spread, so
+// the case still emits valid output instead of crashing.
+const NEUTRAL_SIGMA = 2.0;
 
 interface TrophySpec {
   id: number;
@@ -178,6 +187,12 @@ function round4(x: number): number {
  * enforced afterwards so equal neighbours stay non-decreasing.
  */
 function quantilesFrom(medianLogit: number, sigma: number): number[] {
+  // A non-finite median or spread (bad timestamps, absurd
+  // horizons) must never reach the output as null: fall back
+  // to the neutral forecast.
+  if (!Number.isFinite(medianLogit) || !Number.isFinite(sigma)) {
+    return quantilesFrom(0, NEUTRAL_SIGMA);
+  }
   const qs = Z_SCORES.map((z) => round4(invLogit(medianLogit + z * sigma)));
   for (let i = 1; i < qs.length; i++) {
     if (qs[i] < qs[i - 1]) qs[i] = qs[i - 1];
@@ -190,24 +205,34 @@ function forecastCase(c: TrophyCase, fileName: string): ForecastRow[] {
   if (c.levels.length !== LEVELS.length || c.levels.some((t, j) => t !== LEVELS[j])) {
     throw new Error(`${fileName} asks for levels ${JSON.stringify(c.levels)}, expected ${JSON.stringify(LEVELS)}`);
   }
-  const lastRead = c.history[c.history.length - 1];
+  const history = c.history ?? [];
+  const lastRead = history[history.length - 1];
   if (lastRead === undefined) {
-    throw new Error(`${fileName} has no history`);
+    // No history at all: a crash would invalidate the whole
+    // case, so emit a neutral, wide forecast instead.
+    return c.trophies.map((t) => ({ id: t.id, q: quantilesFrom(0, NEUTRAL_SIGMA) }));
   }
-  const horizonDays = c.horizon_minutes / MINUTES_PER_DAY;
-  const horizonHours = c.horizon_minutes / 60;
+  // A negative or missing horizon is meaningless; clamp it so
+  // the square-root terms below stay finite.
+  const horizonMinutes = Number.isFinite(c.horizon_minutes) ? Math.max(0, c.horizon_minutes) : 0;
+  const horizonDays = horizonMinutes / MINUTES_PER_DAY;
+  const horizonHours = horizonMinutes / 60;
+  // At a zero horizon the target is the checkpoint itself, so
+  // uncertainty terms that need time to act (refresh jumps,
+  // trend extrapolation) vanish; the median is the last rate.
+  const spreadGate = horizonDays > 0 ? 1 : 0;
   const xTarget = logTime(c.target);
   const lastAtMs = Date.parse(lastRead.at);
   const windowStartMs = lastAtMs - RECENT_WINDOW_MS;
-  let window = c.history.filter((r) => Date.parse(r.at) >= windowStartMs);
-  if (window.length < 3) window = c.history;
+  let window = history.filter((r) => Date.parse(r.at) >= windowStartMs);
+  if (window.length < 3) window = history;
 
   // --- Player growth: log-linear fit over the recent reads. ---
   const playerFit = ols(
     window.map((r) => hoursSinceRelease(r.at)),
     window.map((r) => Math.log(Math.max(1, r.players_tracked))),
   );
-  const firstPlayers = Math.max(1, c.history[0].players_tracked);
+  const firstPlayers = Math.max(1, history[0].players_tracked);
   const lastPlayers = Math.max(1, lastRead.players_tracked);
   const observedGrowth = Math.log(lastPlayers / firstPlayers);
   // Prior growth decays as observed growth evidence accumulates.
@@ -223,7 +248,7 @@ function forecastCase(c: TrophyCase, fileName: string): ForecastRow[] {
   for (let i = 0; i < c.trophies.length; i++) {
     let prev: number | null = null;
     let maxJump = 0;
-    for (const r of c.history) {
+    for (const r of history) {
       const rate = r.rates[i] ?? null;
       if (rate === null) continue;
       if (prev !== null) {
@@ -256,11 +281,11 @@ function forecastCase(c: TrophyCase, fileName: string): ForecastRow[] {
     }
     let lastRate = 0;
     let xLast = logTime(lastRead.at);
-    for (let j = c.history.length - 1; j >= 0; j--) {
-      const rate = c.history[j].rates[i] ?? null;
+    for (let j = history.length - 1; j >= 0; j--) {
+      const rate = history[j].rates[i] ?? null;
       if (rate !== null) {
         lastRate = rate;
-        xLast = logTime(c.history[j].at);
+        xLast = logTime(history[j].at);
         break;
       }
     }
@@ -332,7 +357,9 @@ function forecastCase(c: TrophyCase, fileName: string): ForecastRow[] {
 
     const medianLogit = TREND_WEIGHT * trendLogit + (1 - TREND_WEIGHT) * dilutionLogit;
     const sigma = Math.sqrt(
-      randomWalk * randomWalk + trendUnc * trendUnc + refreshSigma * refreshSigma,
+      randomWalk * randomWalk +
+      (spreadGate * trendUnc) ** 2 +
+      (spreadGate * refreshSigma) ** 2,
     );
     return { id: t.id, q: quantilesFrom(medianLogit, sigma) };
   });
@@ -344,7 +371,18 @@ mkdirSync(OUTPUT_DIR, { recursive: true });
 const caseFiles = readdirSync(INPUT_DIR).filter((f) => f.endsWith('.in')).sort();
 for (const file of caseFiles) {
   const caseId = file.slice(0, -'.in'.length);
-  const parsed = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as TrophyCase;
-  const rows = forecastCase(parsed, file);
-  writeFileSync(join(OUTPUT_DIR, `${caseId}.out`), `${JSON.stringify({ trophies: rows })}\n`);
+  let parsed: TrophyCase | null = null;
+  try {
+    parsed = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as TrophyCase;
+    const rows = forecastCase(parsed, file);
+    writeFileSync(join(OUTPUT_DIR, `${caseId}.out`), `${JSON.stringify({ trophies: rows })}\n`);
+  } catch {
+    // One bad case must not abort the whole run: fall back to a
+    // neutral forecast when the trophy list survived parsing.
+    // (If even parsing failed there is nothing valid to emit.)
+    if (parsed !== null && Array.isArray(parsed.trophies)) {
+      const rows = parsed.trophies.map((t) => ({ id: t.id, q: quantilesFrom(0, NEUTRAL_SIGMA) }));
+      writeFileSync(join(OUTPUT_DIR, `${caseId}.out`), `${JSON.stringify({ trophies: rows })}\n`);
+    }
+  }
 }
