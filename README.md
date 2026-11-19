@@ -12,11 +12,16 @@ case's history of Exophase reads and writes one forecast file per
 case. Scored by mean pinball loss on the logit scale; a prize needs
 a loss strictly below the best house entry's.
 
-Phase 1 is a skeleton forecaster: the median holds each trophy's
-rate from the case's last read (persistence), with a spread that
-widens like a random walk on the logit scale with the horizon
-(sigma 0.5 per square-root day). Later phases replace the model
-core with a real forecaster.
+Phase 2 is a real forecaster. Each trophy's median blends a
+logit trend (least squares of logit(rate) against ln(1 + hours
+since release) over the recent reads, slope shrunk toward the
+tier mean and toward zero when thin) with a dilution model
+(earned counts projected forward and divided by projected
+players_tracked, whose growth carries a launch-week prior when
+history is flat). The spread combines a random-walk term
+(sigma 0.5 per square-root day), trend/residual uncertainty,
+and a refresh-jump term with a floor wide enough to cover a
+launch-night-scale Exophase refresh when history is flat.
 
 ## Run it
 
